@@ -1,0 +1,11 @@
+{
+  "name": "UpSnap",
+  "author": "you",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "network"],
+    "description": "Wake, shut down, reboot and sleep devices managed by your UpSnap server.",
+    "image": "https://opengraph.githubassets.com/1/seriousm4x/UpSnap"
+  }
+}
