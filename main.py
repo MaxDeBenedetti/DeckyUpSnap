@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -9,16 +10,18 @@ import decky
 
 SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "upsnap.json")
 
+# NOTE: the password is deliberately NOT stored. Only the auth token is.
 DEFAULTS = {
     "url": "",
     "username": "",
-    "password": "",
     "admin": False,  # log in as a PocketBase superuser instead of a normal user
     "insecure": False,  # accept self-signed TLS certificates
     "token": "",
+    "token_time": 0,  # when the token was issued/refreshed (unix seconds)
 }
-PUBLIC_KEYS = ("url", "username", "password", "admin", "insecure")
+PUBLIC_KEYS = ("url", "username", "admin", "insecure")
 ACTIONS = ("wake", "shutdown", "sleep", "reboot")
+REFRESH_AFTER = 6 * 3600  # extend the token if it is older than this
 
 
 class ApiError(Exception):
@@ -28,24 +31,27 @@ class ApiError(Exception):
         self.message = message
 
 
-def _load_settings() -> dict:
-    settings = dict(DEFAULTS)
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            settings.update(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return settings
-
-
 def _save_settings(settings: dict) -> None:
     os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+    # create the file with owner-only permissions from the start
+    fd = os.open(SETTINGS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(settings, f)
+
+
+def _load_settings() -> dict:
+    settings = dict(DEFAULTS)
+    stored = {}
     try:
-        os.chmod(SETTINGS_FILE, 0o600)
-    except OSError:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         pass
+    settings.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    if "password" in stored:
+        # migrate: an older version saved the password; scrub it from disk
+        _save_settings(settings)
+    return settings
 
 
 def _http(method, url, token=None, body=None, insecure=False, timeout=10):
@@ -89,30 +95,65 @@ def _http(method, url, token=None, body=None, insecure=False, timeout=10):
         return raw
 
 
-def _login(s: dict) -> None:
-    collection = "_superusers" if s["admin"] else "users"
+def _collection(s: dict) -> str:
+    return "_superusers" if s["admin"] else "users"
+
+
+def _clear_token(s: dict) -> None:
+    s["token"] = ""
+    s["token_time"] = 0
+    _save_settings(s)
+
+
+def _expired(s: dict) -> ApiError:
+    _clear_token(s)
+    return ApiError(401, "Session expired. Please log in again.")
+
+
+def _login(s: dict, password: str) -> None:
     res = _http(
         "POST",
-        f"{s['url']}/api/collections/{collection}/auth-with-password",
-        body={"identity": s["username"], "password": s["password"]},
+        f"{s['url']}/api/collections/{_collection(s)}/auth-with-password",
+        body={"identity": s["username"], "password": password},
         insecure=s["insecure"],
     )
     s["token"] = res["token"]
+    s["token_time"] = time.time()
     _save_settings(s)
+
+
+def _refresh_token(s: dict) -> None:
+    """Ask the server for a fresh token so an actively used session never lapses."""
+    try:
+        res = _http(
+            "POST",
+            f"{s['url']}/api/collections/{_collection(s)}/auth-refresh",
+            token=s["token"],
+            insecure=s["insecure"],
+        )
+        s["token"] = res["token"]
+        s["token_time"] = time.time()
+        _save_settings(s)
+    except ApiError as e:
+        if e.status == 401:
+            raise _expired(s)
+        # network hiccup etc.: keep the current token, the real request will report it
+    except (KeyError, TypeError):
+        pass
 
 
 def _authed(s: dict, method: str, path: str):
     if not s["url"]:
         raise ApiError(0, "Server URL is not set")
     if not s["token"]:
-        _login(s)
-    url = f"{s['url']}{path}"
+        raise ApiError(401, "Not logged in")
+    if time.time() - s["token_time"] > REFRESH_AFTER:
+        _refresh_token(s)
     try:
-        return _http(method, url, token=s["token"], insecure=s["insecure"])
+        return _http(method, f"{s['url']}{path}", token=s["token"], insecure=s["insecure"])
     except ApiError as e:
-        if e.status in (401, 403):
-            _login(s)  # token probably expired, retry once
-            return _http(method, url, token=s["token"], insecure=s["insecure"])
+        if e.status == 401:
+            raise _expired(s)
         raise
 
 
@@ -154,28 +195,37 @@ class Plugin:
     # ---- callable from the frontend ----
 
     async def get_settings(self):
-        return {k: self.settings[k] for k in PUBLIC_KEYS}
+        out = {k: self.settings[k] for k in PUBLIC_KEYS}
+        out["logged_in"] = bool(self.settings["token"])
+        return out
 
     async def save_settings(self, new: dict):
+        before = (self.settings["url"], self.settings["username"], self.settings["admin"])
         for k in PUBLIC_KEYS:
             if k in new:
                 self.settings[k] = new[k]
         self.settings["url"] = str(self.settings["url"]).strip().rstrip("/")
         if self.settings["url"] and "://" not in self.settings["url"]:
             self.settings["url"] = "http://" + self.settings["url"]
-        self.settings["token"] = ""  # force re-login with the new credentials
+        after = (self.settings["url"], self.settings["username"], self.settings["admin"])
+        if before != after:
+            self.settings["token"] = ""  # a token for another server/account is useless
+            self.settings["token_time"] = 0
         _save_settings(self.settings)
         return True
 
-    async def test_connection(self):
+    async def login(self, password: str):
         def work():
-            self.settings["token"] = ""
             if not self.settings["url"]:
                 raise ApiError(0, "Server URL is not set")
-            _login(self.settings)
+            _login(self.settings, password)
             return {}
 
         return await self._run(work)
+
+    async def logout(self):
+        _clear_token(self.settings)
+        return True
 
     async def list_devices(self):
         def work():
